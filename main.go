@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -36,6 +37,8 @@ func init() {
 			"  -o, --output <string>     Output directory name (default 'out')",
 			"  -p, --proxy <string>      Use proxy on given URL",
 			"  -w, --overwrite           Overwrite output files when they already exist",
+			"  -f  --infile              File to read urls from instead of STDIN",
+			"  -m  --output-mode         Output mode to use [text, json] (default 'text')",
 			"      --no-third-party      Do not save responses to requests on third-party domains",
 			"      --third-party         Only save responses to requests on third-party domains",
 			"",
@@ -55,6 +58,21 @@ type options struct {
 	concurrency    int
 	js             string
 	proxy          string
+	inFile         string
+	outputMode     string
+}
+
+type response struct {
+	Parent string
+	Url    string
+
+	RequestHeaders []string
+	RequestBody    string
+	RequestMethod  string
+
+	ResponseHeaders []string
+	ResponseType    string
+	ResponseBody    string
 }
 
 func main() {
@@ -84,6 +102,12 @@ func main() {
 
 	flag.StringVar(&opts.proxy, "p", "", "")
 	flag.StringVar(&opts.proxy, "proxy", "", "")
+
+	flag.StringVar(&opts.inFile, "f", "", "")
+	flag.StringVar(&opts.inFile, "infile", "", "")
+
+	flag.StringVar(&opts.outputMode, "m", "text", "")
+	flag.StringVar(&opts.outputMode, "output-mode", "text", "")
 
 	flag.Parse()
 
@@ -119,8 +143,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error starting browser: %s\n", err)
 		return
 	}
-
-	sc := bufio.NewScanner(os.Stdin)
 
 	var wg sync.WaitGroup
 	jobs := make(chan string)
@@ -163,8 +185,22 @@ func main() {
 			wg.Done()
 		}()
 	}
+
+	var sc *bufio.Scanner
+	if opts.inFile == "" {
+		sc = bufio.NewScanner(os.Stdin)
+	} else {
+		f, err := os.Open(opts.inFile)
+		if err != nil {
+			panic(err)
+		}
+		sc = bufio.NewScanner(f)
+	}
 	for sc.Scan() {
 		jobs <- sc.Text()
+	}
+	if sc.Err() != nil {
+		panic(sc.Err())
 	}
 	close(jobs)
 
@@ -200,6 +236,62 @@ func saveResponse(requestURL string, data []byte, output string, overwrite bool)
 	}
 
 	return path, ioutil.WriteFile(path, data, 0644)
+}
+
+func saveResponseJson(requestURL string, data []byte, output string, overwrite bool, ev *fetch.EventRequestPaused, parentURL string) (string, error) {
+	path, err := makeFilepath(output, requestURL)
+	if err != nil {
+		return "", err
+	}
+
+	dir := filepath.Dir(path)
+	err = os.MkdirAll(dir, 0755)
+	if err != nil {
+		return "", err
+	}
+
+	i := 1
+	for !overwrite {
+		// should probably do something like get all the files
+		// that start with the path, sort them, pick a number
+		// one higher than the highest, or something like that
+		// but unless there's thousands of duplicate file this
+		// will work just fine
+		if _, err := os.Stat(path); err != nil {
+			break
+		}
+
+		path = fmt.Sprintf("%s.%d", strings.TrimRight(path, ".1234567890"), i)
+		i++
+	}
+	path = path + ".json"
+
+	b := &bytes.Buffer{}
+
+	b.WriteRune('\n')
+
+	var requestHeaders []string
+	for k, v := range ev.Request.Headers {
+		requestHeaders = append(requestHeaders, fmt.Sprintf("%s: %s", k, v))
+	}
+
+	var responseHeaders []string
+	for _, h := range ev.ResponseHeaders {
+		responseHeaders = append(responseHeaders, fmt.Sprintf("%s: %s", h.Name, h.Value))
+	}
+	response := response{Url: ev.Request.URL, Parent: parentURL, RequestMethod: ev.Request.Method,
+		RequestHeaders: requestHeaders, ResponseHeaders: responseHeaders, ResponseType: ev.ResourceType.String(), ResponseBody: string(data)}
+
+	if ev.Request.PostData != "" {
+		response.RequestBody = fmt.Sprintf("%s", ev.Request.PostData)
+	}
+
+	outJson, err := json.Marshal(response)
+	if err != nil {
+		return "", err
+	}
+
+	return path, ioutil.WriteFile(path, outJson, 0644)
 
 }
 
@@ -343,17 +435,25 @@ func makeListener(ctx context.Context, requestURL string, opts options) func(int
 							return nil
 						}
 
-						path, err := saveResponse(ev.Request.URL, data, opts.output, opts.overwrite)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "failed to save response data for %s: %s\n", ev.Request.URL, err)
-							return nil
-						}
+						if opts.outputMode == "json" {
+							_, err = saveResponseJson(ev.Request.URL, data, opts.output, opts.overwrite, ev, requestURL)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "failed to save response data for %s: %s\n", ev.Request.URL, err)
+								return nil
+							}
+						} else {
+							path, err := saveResponse(ev.Request.URL, data, opts.output, opts.overwrite)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "failed to save response data for %s: %s\n", ev.Request.URL, err)
+								return nil
+							}
 
-						// save the headers etc in a separate file
-						err = saveMeta(path+".meta", requestURL, ev)
-						if err != nil {
-							fmt.Fprintf(os.Stderr, "failed to save response meta data for %s: %s\n", ev.Request.URL, err)
-							return nil
+							// save the headers etc in a separate file
+							err = saveMeta(path+".meta", requestURL, ev)
+							if err != nil {
+								fmt.Fprintf(os.Stderr, "failed to save response meta data for %s: %s\n", ev.Request.URL, err)
+								return nil
+							}
 						}
 
 						// Log the request
